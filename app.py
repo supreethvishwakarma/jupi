@@ -15,7 +15,6 @@ from smartmoneyconcepts import smc
 st.set_page_config(page_title="SMC Dashboard", layout="wide")
 
 PAPER_FILE = "paper_positions.json"
-LOT = 65
 
 
 # ---------------------------------------------------------------- broker
@@ -32,12 +31,26 @@ def broker():
 
 @st.cache_data(ttl=300, show_spinner="fetching candles…")
 def fetch(frm, to, interval, token="99926000", exch="NSE"):
-    r = broker().getCandleData(dict(exchange=exch, symboltoken=token,
-                                    interval=interval, fromdate=frm, todate=to))
-    df = pd.DataFrame(r["data"],
-                      columns=["timestamp", "open", "high", "low", "close", "volume"])
+    import time as _t
+    a = pd.to_datetime(frm); b = pd.to_datetime(to)
+    span = 45 if interval in ("ONE_MINUTE", "THREE_MINUTE") else 90
+    parts, cur = [], a
+    while cur < b:
+        end = min(cur + pd.Timedelta(days=span), b)
+        r = broker().getCandleData(dict(exchange=exch, symboltoken=token,
+                                        interval=interval,
+                                        fromdate=cur.strftime("%Y-%m-%d %H:%M"),
+                                        todate=end.strftime("%Y-%m-%d %H:%M")))
+        if r.get("data"):
+            parts.append(pd.DataFrame(r["data"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"]))
+        cur = end + pd.Timedelta(minutes=1)
+        _t.sleep(2)
+    if not parts:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    df = pd.concat(parts).drop_duplicates("timestamp")
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df.reset_index(drop=True)
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------- strategy
@@ -109,6 +122,10 @@ def chart(df, sw, sig, days, swing_length):
                     f.add_annotation(x=bt, y=e.Level, text=e.type, showarrow=True,
                                      arrowhead=2, font=dict(size=9, color="white"),
                                      bgcolor="#e67e22" if e.type == "CHoCH" else "#7f8c8d")
+    f.update_xaxes(rangebreaks=[
+        dict(bounds=["sat", "mon"]),
+        dict(bounds=[15.5, 9.25], pattern="hour"),
+    ])
     f.update_layout(height=600, xaxis_rangeslider_visible=False,
                     margin=dict(t=30, b=20), title=f"SWING_LENGTH={swing_length}")
     return f
@@ -132,8 +149,44 @@ SWING = st.sidebar.slider("Swing length", 3, 60, 20, 1,
 SIGNAL = st.sidebar.selectbox("Signal", ["BOS", "CHoCH", "both"], index=0)
 RR = st.sidebar.slider("Risk : Reward", 0.5, 5.0, 2.0, 0.5)
 CLOSE_BREAK = st.sidebar.checkbox("Confirm break on close", True)
+INSTRUMENTS = {
+    "NIFTY 50":        ("99926000", "NSE", 65),
+    "NIFTY BANK":      ("99926009", "NSE", 35),
+    "FINNIFTY":        ("99926037", "NSE", 65),
+    "MIDCPNIFTY":      ("99926074", "NSE", 120),
+    "CRUDEOIL Sep26":  ("565899",   "MCX", 100),
+    "CRUDEOIL Oct26":  ("569900",   "MCX", 100),
+}
+INST = st.sidebar.selectbox("Instrument", list(INSTRUMENTS))
+TOKEN, EXCH, LOT = INSTRUMENTS[INST]
+if EXCH == "MCX":
+    st.sidebar.warning("MCX futures expire monthly. History is limited to this "
+                       "contract's life, and stitching contracts creates fake "
+                       "price jumps that look like real breaks.")
+
 INTERVAL = st.sidebar.selectbox("Interval",
                                 ["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE"], 2)
+st.sidebar.divider()
+st.sidebar.subheader("Capital")
+LOTSIZE = st.sidebar.number_input("Lot size (exchange)", 1, 5000, LOT, 1,
+    key=f"lotsize_{INST}",
+    help="Fixed by the exchange - NIFTY 65, BANKNIFTY 35, CRUDEOIL 100. "
+         "Only change it if the exchange revises the contract.")
+LOTS = st.sidebar.number_input("Number of lots", 1, 50, 1, 1, key="lots",
+    help="How many contracts you buy. This is the one you control.")
+QTY = LOTSIZE * LOTS
+LOT = QTY
+st.sidebar.success(f"**Quantity: {QTY:,}**  ({LOTSIZE} x {LOTS} lots)")
+
+st.sidebar.divider()
+st.sidebar.subheader("Option buying")
+OPT_MODE = st.sidebar.checkbox("Simulate option buying", True)
+PREMIUM = st.sidebar.number_input("ATM premium (Rs)", 20, 500, 140, 10)
+DELTA = st.sidebar.slider("Delta", 0.3, 0.8, 0.5, 0.05)
+THETA_HR = st.sidebar.slider("Theta (pts/hour)", 0.0, 10.0, 3.0, 0.5)
+SPREAD = st.sidebar.slider("Spread (pts/trade)", 0.0, 5.0, 1.0, 0.25)
+st.sidebar.divider()
+
 COST_PTS = st.sidebar.number_input("Cost per trade (points)", 0.0, 20.0, 2.0, 0.5,
                                    help="Brokerage + STT + slippage. Be pessimistic.")
 
@@ -150,7 +203,7 @@ with tab_bt:
     to = c2.date_input("To", dt.date(2026, 9, 10))
 
     if st.button("Run backtest", type="primary"):
-        df = fetch(f"{frm} 09:15", f"{to} 15:30", INTERVAL)
+        df = fetch(f"{frm} 09:15", f"{to} 15:30", INTERVAL, TOKEN, EXCH)
         sw, sig = signals(df, SWING, CLOSE_BREAK)
         st.session_state.bt = (df, sw, sig, run_backtest(df, sig, RR, SIGNAL))
 
@@ -170,6 +223,14 @@ with tab_bt:
             st.warning("No trades for these settings.")
         else:
             gross = t.points.sum()
+            if OPT_MODE:
+                hrs = t["hours"] if "hours" in t.columns else pd.Series(2.0, index=t.index)
+                t = t.assign(opt_points=(t.points*DELTA - hrs*THETA_HR - SPREAD).round(2))
+                gross = t.opt_points.sum()
+                st.warning("**Option-buying model** - index moves converted via "
+                           "delta, theta and spread. An approximation, not real "
+                           "option prices.")
+            pc = t.opt_points if OPT_MODE else t.points
             net = gross - COST_PTS * len(t)
             h = len(t) // 2
             h1, h2 = t.points[:h].sum(), t.points[h:].sum()
@@ -180,6 +241,17 @@ with tab_bt:
             k[1].metric("Win rate", f"{100*(t.points>0).mean():.0f}%")
             k[2].metric("Gross", f"{gross:+.0f} pts")
             k[3].metric(f"Net @ {COST_PTS}", f"{net:+.0f} pts", f"Rs {net*LOT:+,.0f}")
+
+            _eq = pc.cumsum(); _dd = (_eq - _eq.cummax()).min()
+            _per = (PREMIUM*QTY) if OPT_MODE else 0
+            _ddrs = abs(_dd*LOT)
+            st.subheader("Capital required")
+            cc = st.columns(3)
+            cc[0].metric("Per trade", f"Rs {_per:,.0f}")
+            cc[1].metric("Drawdown buffer", f"Rs {_ddrs:,.0f}")
+            cc[2].metric("Minimum capital", f"Rs {_per + _ddrs:,.0f}")
+            st.caption(f"Comfortable: Rs {_per + 2*_ddrs:,.0f}. If one drawdown "
+                       "costs more than ~25% of your account, the size is too big.")
             k[4].metric("Max DD", f"{(eq-eq.cummax()).min():.0f} pts")
 
             if h1 > 0 and h2 > 0:
@@ -206,7 +278,7 @@ with tab_paper:
     if a.button("Check for signals now", type="primary"):
         end = dt.datetime.now()
         df = fetch((end - dt.timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
-                   end.strftime("%Y-%m-%d %H:%M"), INTERVAL)
+                   end.strftime("%Y-%m-%d %H:%M"), INTERVAL, TOKEN, EXCH)
         sw, sig = signals(df, SWING, CLOSE_BREAK)
         use = sig if SIGNAL == "both" else sig[sig.type == SIGNAL]
 
