@@ -69,12 +69,9 @@ def tick_service():
             self.lock = threading.Lock()
             self.ready = False
             self.sws = None
-            self.last_reconnect_attempt = 0
             self._connect()
 
         def _connect(self):
-            self.subscribed = set()
-            self.ready = False
             api_key = os.environ["ANGEL_API_KEY"]
             client_id = os.environ["ANGEL_CLIENT_ID"]
             o = SmartConnect(api_key=api_key)
@@ -106,22 +103,6 @@ def tick_service():
             self.sws.on_error = on_error
             self.sws.on_close = on_close
             threading.Thread(target=self.sws.connect, daemon=True).start()
-
-        def ensure_connected(self):
-            """If the WebSocket has died (exhausted its own retry budget, or
-            never came up), proactively reconnect instead of staying dead for
-            the rest of the process. 60s cooldown between attempts so a truly
-            down connection doesn't hammer the login endpoint."""
-            if self.ready:
-                return
-            now_ts = _time.time()
-            if now_ts - self.last_reconnect_attempt < 60:
-                return
-            self.last_reconnect_attempt = now_ts
-            try:
-                self._connect()
-            except Exception:
-                pass
 
         def ensure_subscribed(self, exch, token):
             key = (exch, str(token))
@@ -340,7 +321,7 @@ def _parse_expiry_code(code):
 
 
 @st.cache_data(ttl=300, show_spinner="looking up the option chain…")
-def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded, min_runway_days=0):
+def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded):
     """Looks up the real, currently-listed option chain for `prefix` on
     `search_exch` and returns the ATM CE/PE contracts for the nearest
     upcoming expiry, or None if unavailable. Cached for 5 minutes and keyed
@@ -383,9 +364,7 @@ def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded, min_r
         return None
     today = dt.datetime.now()
     codes = sorted(set(p[0] for p in parsed), key=_parse_expiry_code)
-    upcoming = [c for c in codes if _parse_expiry_code(c) >= today + dt.timedelta(days=min_runway_days)]
-    if not upcoming:
-        upcoming = [c for c in codes if _parse_expiry_code(c) >= today - dt.timedelta(days=1)]  # fallback: nearest anyway
+    upcoming = [c for c in codes if _parse_expiry_code(c) >= today - dt.timedelta(days=1)]
     if not upcoming:
         return None
     nearest = upcoming[0]
@@ -492,20 +471,16 @@ def supertrend_current_value(df, period=10, multiplier=3.0):
 
 
 def get_option_config(inst_name):
-    """Maps an instrument name to (search_prefix, search_exchange, weekly_1letter,
-    min_runway_days) for its option chain. Handles CRUDEOIL's dynamically-named
-    contract via prefix match. min_runway_days requires the picked expiry be at
-    least that many days out -- 0 for index options (trading the nearest weekly,
-    even on expiry day, is normal and often the most liquid choice), but a real
-    safety margin for CRUDEOIL, whose options liquidity near expiry is unverified."""
+    """Maps an instrument name to (search_prefix, search_exchange, weekly_1letter)
+    for its option chain. Handles CRUDEOIL's dynamically-named contract via prefix match."""
     if inst_name.startswith("CRUDEOIL"):
-        return ("CRUDEOIL", "MCX", False, 5)
+        return ("CRUDEOIL", "MCX", False)
     return {
-        "NIFTY 50": ("NIFTY", "NFO", False, 0),
-        "NIFTY BANK": ("BANKNIFTY", "NFO", False, 0),
-        "FINNIFTY": ("FINNIFTY", "NFO", False, 0),
-        "MIDCPNIFTY": ("MIDCPNIFTY", "NFO", False, 0),
-        "SENSEX": ("SENSEX", "BFO", True, 0),
+        "NIFTY 50": ("NIFTY", "NFO", False),
+        "NIFTY BANK": ("BANKNIFTY", "NFO", False),
+        "FINNIFTY": ("FINNIFTY", "NFO", False),
+        "MIDCPNIFTY": ("MIDCPNIFTY", "NFO", False),
+        "SENSEX": ("SENSEX", "BFO", True),
     }.get(inst_name)
 
 
@@ -633,11 +608,7 @@ def lookup_crude_contracts():
             return dt.datetime.max
 
     rows.sort(key=lambda r: parse_expiry(r["tradingsymbol"]))
-
-    today = dt.datetime.now()
-    with_runway = [r for r in rows if parse_expiry(r["tradingsymbol"]) >= today + dt.timedelta(days=7)]
-    chosen = with_runway if with_runway else rows  # fallback: if everything's within 7 days, use nearest anyway
-    return chosen[:1]  # the nearest contract WITH real runway, not the literal soonest one
+    return rows[:1]  # just the single nearest contract, not two confusing ones
 
 # ---------------------------------------------------------------- sidebar
 
@@ -981,7 +952,6 @@ with tab_paper:
         pp = load_paper()
         now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
         ts = tick_service()
-        ts.ensure_connected()
 
         blocked_total = sum(p.get("capital_blocked", 0) for name, p in pp["open"].items()
                             if p.get("status") == "open" and name in PAPER_INSTRUMENTS)
@@ -1266,9 +1236,8 @@ with tab_paper:
                                 placed_time=str(now))
                 opt_cfg = get_option_config(inst_name)
                 if opt_cfg is not None:
-                    prefix, search_exch, weekly_1letter, min_runway = opt_cfg
-                    chain = find_atm_option(prefix, search_exch, weekly_1letter,
-                                             round(entry_close/100)*100, min_runway)
+                    prefix, search_exch, weekly_1letter = opt_cfg
+                    chain = find_atm_option(prefix, search_exch, weekly_1letter, round(entry_close/100)*100)
                     if chain is not None:
                         bull = last_sig.direction == "bullish"
                         new_pos["option_token"] = chain["ce_token"] if bull else chain["pe_token"]

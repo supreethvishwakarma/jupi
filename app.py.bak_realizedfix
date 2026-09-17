@@ -69,12 +69,9 @@ def tick_service():
             self.lock = threading.Lock()
             self.ready = False
             self.sws = None
-            self.last_reconnect_attempt = 0
             self._connect()
 
         def _connect(self):
-            self.subscribed = set()
-            self.ready = False
             api_key = os.environ["ANGEL_API_KEY"]
             client_id = os.environ["ANGEL_CLIENT_ID"]
             o = SmartConnect(api_key=api_key)
@@ -106,22 +103,6 @@ def tick_service():
             self.sws.on_error = on_error
             self.sws.on_close = on_close
             threading.Thread(target=self.sws.connect, daemon=True).start()
-
-        def ensure_connected(self):
-            """If the WebSocket has died (exhausted its own retry budget, or
-            never came up), proactively reconnect instead of staying dead for
-            the rest of the process. 60s cooldown between attempts so a truly
-            down connection doesn't hammer the login endpoint."""
-            if self.ready:
-                return
-            now_ts = _time.time()
-            if now_ts - self.last_reconnect_attempt < 60:
-                return
-            self.last_reconnect_attempt = now_ts
-            try:
-                self._connect()
-            except Exception:
-                pass
 
         def ensure_subscribed(self, exch, token):
             key = (exch, str(token))
@@ -236,9 +217,7 @@ def get_signals(df):
         return signals(df, SWING, CLOSE_BREAK)
     if STRATEGY == "ORB 5-Min Breakout":
         return None, orb_signals(df, OR_BARS)
-    if STRATEGY == "Vanguard (RSI x WMA)":
-        return None, hilega_milega_signals(df, RSI_PERIOD, WMA_PERIOD)
-    return None, supertrend_signals(df, ST_PERIOD, ST_MULT)
+    return None, hilega_milega_signals(df, RSI_PERIOD, WMA_PERIOD)
 
 
 def real_options_cost(entry_premium, exit_premium, qty):
@@ -340,7 +319,7 @@ def _parse_expiry_code(code):
 
 
 @st.cache_data(ttl=300, show_spinner="looking up the option chain…")
-def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded, min_runway_days=0):
+def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded):
     """Looks up the real, currently-listed option chain for `prefix` on
     `search_exch` and returns the ATM CE/PE contracts for the nearest
     upcoming expiry, or None if unavailable. Cached for 5 minutes and keyed
@@ -383,9 +362,7 @@ def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded, min_r
         return None
     today = dt.datetime.now()
     codes = sorted(set(p[0] for p in parsed), key=_parse_expiry_code)
-    upcoming = [c for c in codes if _parse_expiry_code(c) >= today + dt.timedelta(days=min_runway_days)]
-    if not upcoming:
-        upcoming = [c for c in codes if _parse_expiry_code(c) >= today - dt.timedelta(days=1)]  # fallback: nearest anyway
+    upcoming = [c for c in codes if _parse_expiry_code(c) >= today - dt.timedelta(days=1)]
     if not upcoming:
         return None
     nearest = upcoming[0]
@@ -423,89 +400,17 @@ def find_atm_option(prefix, search_exch, weekly_1letter, spot_ltp_rounded, min_r
                 expiry=nearest, strike=strike, exch=search_exch)
 
 
-def supertrend_indicator(df, period=10, multiplier=3.0):
-    """Standard Supertrend: an ATR-based band that flips sides of price and,
-    while on one side, only ever moves toward price (never away) -- this is
-    what makes it a genuine trailing stop, not just an entry signal."""
-    high, low, close = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
-    hl2 = (high + low) / 2
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    basic_upper = hl2 + multiplier * atr
-    basic_lower = hl2 - multiplier * atr
-
-    final_upper = basic_upper.copy()
-    final_lower = basic_lower.copy()
-    st_line = pd.Series(index=df.index, dtype=float)
-    direction = pd.Series(index=df.index, dtype=object)
-
-    for i in range(len(df)):
-        if i == 0 or pd.isna(atr.iloc[i]):
-            final_upper.iloc[i] = basic_upper.iloc[i]
-            final_lower.iloc[i] = basic_lower.iloc[i]
-            st_line.iloc[i] = final_upper.iloc[i]
-            direction.iloc[i] = "bearish"
-            continue
-        final_upper.iloc[i] = (basic_upper.iloc[i]
-                                if (basic_upper.iloc[i] < final_upper.iloc[i-1] or close.iloc[i-1] > final_upper.iloc[i-1])
-                                else final_upper.iloc[i-1])
-        final_lower.iloc[i] = (basic_lower.iloc[i]
-                                if (basic_lower.iloc[i] > final_lower.iloc[i-1] or close.iloc[i-1] < final_lower.iloc[i-1])
-                                else final_lower.iloc[i-1])
-        if direction.iloc[i-1] == "bearish":
-            if close.iloc[i] > final_upper.iloc[i]:
-                direction.iloc[i] = "bullish"
-                st_line.iloc[i] = final_lower.iloc[i]
-            else:
-                direction.iloc[i] = "bearish"
-                st_line.iloc[i] = final_upper.iloc[i]
-        else:
-            if close.iloc[i] < final_lower.iloc[i]:
-                direction.iloc[i] = "bearish"
-                st_line.iloc[i] = final_upper.iloc[i]
-            else:
-                direction.iloc[i] = "bullish"
-                st_line.iloc[i] = final_lower.iloc[i]
-
-    return st_line, direction
-
-
-def supertrend_signals(df, period=10, multiplier=3.0):
-    """Signal fires on every direction flip -- Level is the Supertrend value
-    at that candle, used as the initial (soon-to-be-trailed) stop."""
-    st_line, direction = supertrend_indicator(df, period, multiplier)
-    rows = []
-    for i in range(1, len(df)):
-        if direction.iloc[i] != direction.iloc[i-1]:
-            rows.append(dict(type="ST", direction=direction.iloc[i], broken_i=i, Level=float(st_line.iloc[i])))
-    return pd.DataFrame(rows, columns=["type", "direction", "broken_i", "Level"])
-
-
-def supertrend_current_value(df, period=10, multiplier=3.0):
-    """Just the latest Supertrend line value, for updating a trailing SL on an open position."""
-    if len(df) <= period:
-        return None
-    st_line, _ = supertrend_indicator(df, period, multiplier)
-    v = st_line.iloc[-1]
-    return None if pd.isna(v) else float(v)
-
-
 def get_option_config(inst_name):
-    """Maps an instrument name to (search_prefix, search_exchange, weekly_1letter,
-    min_runway_days) for its option chain. Handles CRUDEOIL's dynamically-named
-    contract via prefix match. min_runway_days requires the picked expiry be at
-    least that many days out -- 0 for index options (trading the nearest weekly,
-    even on expiry day, is normal and often the most liquid choice), but a real
-    safety margin for CRUDEOIL, whose options liquidity near expiry is unverified."""
+    """Maps an instrument name to (search_prefix, search_exchange, weekly_1letter)
+    for its option chain. Handles CRUDEOIL's dynamically-named contract via prefix match."""
     if inst_name.startswith("CRUDEOIL"):
-        return ("CRUDEOIL", "MCX", False, 5)
+        return ("CRUDEOIL", "MCX", False)
     return {
-        "NIFTY 50": ("NIFTY", "NFO", False, 0),
-        "NIFTY BANK": ("BANKNIFTY", "NFO", False, 0),
-        "FINNIFTY": ("FINNIFTY", "NFO", False, 0),
-        "MIDCPNIFTY": ("MIDCPNIFTY", "NFO", False, 0),
-        "SENSEX": ("SENSEX", "BFO", True, 0),
+        "NIFTY 50": ("NIFTY", "NFO", False),
+        "NIFTY BANK": ("BANKNIFTY", "NFO", False),
+        "FINNIFTY": ("FINNIFTY", "NFO", False),
+        "MIDCPNIFTY": ("MIDCPNIFTY", "NFO", False),
+        "SENSEX": ("SENSEX", "BFO", True),
     }.get(inst_name)
 
 
@@ -633,48 +538,34 @@ def lookup_crude_contracts():
             return dt.datetime.max
 
     rows.sort(key=lambda r: parse_expiry(r["tradingsymbol"]))
-
-    today = dt.datetime.now()
-    with_runway = [r for r in rows if parse_expiry(r["tradingsymbol"]) >= today + dt.timedelta(days=7)]
-    chosen = with_runway if with_runway else rows  # fallback: if everything's within 7 days, use nearest anyway
-    return chosen[:1]  # the nearest contract WITH real runway, not the literal soonest one
+    return rows[:1]  # just the single nearest contract, not two confusing ones
 
 # ---------------------------------------------------------------- sidebar
 
 st.sidebar.header("Strategy")
 STRATEGY = st.sidebar.selectbox("Strategy",
-    ["SMC BOS/CHoCH", "ORB 5-Min Breakout", "Vanguard (RSI x WMA)", "Supertrend (Trailing SL)"], index=0)
+    ["SMC BOS/CHoCH", "ORB 5-Min Breakout", "Hilega Milega (RSI x WMA)"], index=0)
 
 if STRATEGY == "SMC BOS/CHoCH":
     SWING = st.sidebar.slider("Swing length", 3, 60, 20, 1,
                                help="Candles either side defining a swing. Tune this on the CHART, not the P&L.")
     SIGNAL = st.sidebar.selectbox("Signal", ["BOS", "CHoCH", "both"], index=0)
     CLOSE_BREAK = st.sidebar.checkbox("Confirm break on close", True)
-    OR_BARS, RSI_PERIOD, WMA_PERIOD, ST_PERIOD, ST_MULT = 1, 9, 21, 7, 2.5
+    OR_BARS, RSI_PERIOD, WMA_PERIOD = 1, 9, 21
 elif STRATEGY == "ORB 5-Min Breakout":
     OR_BARS = st.sidebar.number_input("Opening range candles", 1, 6, 1, 1,
                                        help="How many candles from the day's open define the range. "
                                             "1 candle = first 5 minutes on a 5-min chart (classic ORB).")
     SWING, SIGNAL, CLOSE_BREAK = 20, "both", True
-    RSI_PERIOD, WMA_PERIOD, ST_PERIOD, ST_MULT = 9, 21, 7, 2.5
-elif STRATEGY == "Vanguard (RSI x WMA)":
+    RSI_PERIOD, WMA_PERIOD = 9, 21
+else:
     RSI_PERIOD = st.sidebar.slider("RSI period", 3, 30, 9, 1)
     WMA_PERIOD = st.sidebar.slider("WMA period (on RSI)", 5, 50, 21, 1,
                                     help="Classic setup: RSI(9) crossing its own WMA(21). "
                                          "Buy on cross above, sell on cross below.")
     SWING, SIGNAL, OR_BARS, CLOSE_BREAK = 20, "both", 1, True
-    ST_PERIOD, ST_MULT = 7, 2.5
-else:
-    ST_PERIOD = st.sidebar.slider("ATR period", 5, 21, 7, 1,
-                                   help="Lower = more responsive (scalping). Classic default is 10; "
-                                        "7 is a common scalping tune.")
-    ST_MULT = st.sidebar.slider("ATR multiplier", 1.0, 5.0, 2.5, 0.5,
-                                 help="Lower = tighter trailing stop, more flips. Classic default is 3.0.")
-    SWING, SIGNAL, OR_BARS, CLOSE_BREAK, RSI_PERIOD, WMA_PERIOD = 20, "both", 1, True, 9, 21
 
-RR = st.sidebar.slider("Risk : Reward", 0.5, 5.0, 2.0, 0.5,
-                        help="For Supertrend, Target is still RR-based, but SL trails live in paper "
-                             "trading -- the trade may exit via trailing stop well before Target.")
+RR = st.sidebar.slider("Risk : Reward", 0.5, 5.0, 2.0, 0.5)
 
 INSTRUMENTS = {
     "NIFTY 50": ("99926000", "NSE", 65),
@@ -713,24 +604,14 @@ st.sidebar.divider()
 st.sidebar.subheader("Capital")
 LOTSIZE = LOT  # exchange-fixed lot size for the selected Instrument -- not user-editable
 st.sidebar.metric("Lot size (exchange-fixed)", f"{LOTSIZE} units/lot")
-
-st.sidebar.caption("Lots per instrument (paper trading):")
-LOTS_PER_INSTRUMENT = {}
-for _inst in PAPER_INSTRUMENTS:
-    _inst_lot_size = INSTRUMENTS[_inst][2]
-    LOTS_PER_INSTRUMENT[_inst] = st.sidebar.number_input(
-        f"{_inst} lots ({_inst_lot_size}/lot)", 1, 50, 1, 1, key=f"lots_{_inst}")
-
-LOTS = LOTS_PER_INSTRUMENT.get(INST, 1)  # used for the single-instrument Backtest tab
+LOTS = st.sidebar.number_input("Number of lots", 1, 50, 1, 1, key="lots",
+                                help="How many contracts you buy. This is the only sizing input you control -- "
+                                     "lot size itself is fixed by the exchange per instrument (NIFTY 50=65, "
+                                     "NIFTY BANK=35, FINNIFTY=65, MIDCPNIFTY=120, SENSEX=10, CRUDEOIL=100) and "
+                                     "is applied automatically and correctly per instrument during paper trading.")
 QTY = LOTSIZE * LOTS
 LOT = QTY
-
-_qty_lines = []
-for _inst in PAPER_INSTRUMENTS:
-    _sz = INSTRUMENTS[_inst][2]
-    _lt = LOTS_PER_INSTRUMENT.get(_inst, 1)
-    _qty_lines.append(f"**{_inst}**: {_sz*_lt:,} units ({_sz} x {_lt} lots)")
-st.sidebar.success("Quantities:  \n" + "  \n".join(_qty_lines))
+st.sidebar.success(f"**Quantity: {QTY:,}** ({LOTSIZE} x {LOTS} lots)")
 
 st.sidebar.divider()
 st.sidebar.subheader("Option buying (backtest model)")
@@ -779,17 +660,11 @@ with tab_bt:
                     "Check the annotated breakouts line up with real range breaks before "
                     "trusting the numbers below.")
             chart_label = f"ORB ({OR_BARS}-candle range)"
-        elif STRATEGY == "Vanguard (RSI x WMA)":
+        else:
             st.info("Signals fire when RSI crosses its own WMA. This is a lagging, "
                     "trend-following setup by nature — expect fewer, later signals "
                     "than SMC/ORB, and more whipsaws in a sideways/choppy market.")
             chart_label = f"RSI({RSI_PERIOD}) x WMA({WMA_PERIOD})"
-        else:
-            st.info("Signals fire on every Supertrend direction flip. In paper trading the "
-                    "stop trails the Supertrend line live and only tightens -- this backtest "
-                    "approximates that with a fixed RR target instead, since it doesn't "
-                    "re-check a moving SL candle-by-candle the same way.")
-            chart_label = f"Supertrend({ST_PERIOD}, {ST_MULT})"
 
         st.plotly_chart(chart(df, sw, sig, st.slider("Days shown", 2, 30, 7), chart_label),
                          use_container_width=True)
@@ -921,7 +796,7 @@ with tab_paper:
         _closed_count = 0
         for _inst_name, _pos in list(_pp["open"].items()):
             _tok, _exch, _lot = INSTRUMENTS.get(_inst_name, (None, None, 1))
-            _qty_i = _lot * LOTS_PER_INSTRUMENT.get(_inst_name, 1)
+            _qty_i = _lot * LOTS
             if _pos.get("status") != "open":
                 del _pp["open"][_inst_name]
                 continue
@@ -981,7 +856,6 @@ with tab_paper:
         pp = load_paper()
         now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
         ts = tick_service()
-        ts.ensure_connected()
 
         blocked_total = sum(p.get("capital_blocked", 0) for name, p in pp["open"].items()
                             if p.get("status") == "open" and name in PAPER_INSTRUMENTS)
@@ -996,19 +870,12 @@ with tab_paper:
         b2.metric("Blocked in trades", f"Rs {blocked_total:,.0f}")
         b3.metric("Total equity", f"Rs {balance + blocked_total:,.0f}")
 
-        _breakdown = {name: p.get("capital_blocked", 0) for name, p in pp["open"].items()
-                      if p.get("status") == "open" and name in PAPER_INSTRUMENTS
-                      and p.get("capital_blocked", 0) > 0}
-        if _breakdown:
-            st.caption("Capital utilization: " + " · ".join(
-                f"{name}: Rs {amt:,.0f}" for name, amt in _breakdown.items()))
-
         st.caption(f"Strategy: **{STRATEGY}** · Instruments: **{', '.join(PAPER_INSTRUMENTS)}**")
 
         any_live = False
         for inst_name in PAPER_INSTRUMENTS:
             tok, exch, lot_size = INSTRUMENTS[inst_name]
-            qty_i = lot_size * LOTS_PER_INSTRUMENT.get(inst_name, 1)
+            qty_i = lot_size * LOTS
             ts.ensure_subscribed(exch, tok)
             ltp = ts.get_ltp(tok)
             any_live = any_live or (ltp is not None)
@@ -1162,7 +1029,7 @@ with tab_paper:
             if "time" in c.columns:
                 c = c.rename(columns={"time": "entry_time"})
             tot = c.points.sum()
-            realized = round(c["pnl_rs"].sum(), 2)  # from actual closed trades only -- excludes any currently-blocked capital
+            realized = pp.get("balance", STARTING_CAPITAL) - STARTING_CAPITAL
             m = st.columns(5)
             m[0].metric("Trades", len(c))
             m[1].metric("Win rate", f"{100*(c.points>0).mean():.0f}%")
@@ -1196,30 +1063,11 @@ with tab_paper:
         any_opened = False
 
         for inst_name in PAPER_INSTRUMENTS:
+            if inst_name in pp["open"]:
+                continue
             tok, exch, _ = INSTRUMENTS[inst_name]
             if not is_market_open(exch, now):
                 continue
-
-            if inst_name in pp["open"]:
-                _existing = pp["open"][inst_name]
-                if STRATEGY == "Supertrend (Trailing SL)" and _existing.get("status") == "open":
-                    time.sleep(1.5)
-                    try:
-                        _st_df = fetch((now - dt.timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
-                                       now.strftime("%Y-%m-%d %H:%M"), INTERVAL, tok, exch)
-                        if not _st_df.empty:
-                            _new_sl = supertrend_current_value(_st_df, ST_PERIOD, ST_MULT)
-                            if _new_sl is not None:
-                                _bull = _existing["dir"] == "bullish"
-                                _updated = max(_existing["sl"], _new_sl) if _bull else min(_existing["sl"], _new_sl)
-                                if round(_updated, 2) != _existing["sl"]:
-                                    _existing["sl"] = round(_updated, 2)
-                                    save_paper(pp)
-                                    st.caption(f"{inst_name}: trailing SL updated to {_existing['sl']}")
-                    except Exception:
-                        pass
-                continue
-
             time.sleep(1.5)
             try:
                 chart_df = fetch((now - dt.timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
@@ -1239,7 +1087,7 @@ with tab_paper:
 
             sw, sig = get_signals(chart_df)
 
-            if STRATEGY == "Vanguard (RSI x WMA)" and len(chart_df) > WMA_PERIOD:
+            if STRATEGY == "Hilega Milega (RSI x WMA)" and len(chart_df) > WMA_PERIOD:
                 _r = _wilder_rsi(chart_df["close"].astype(float), RSI_PERIOD)
                 _w = _wma(_r, WMA_PERIOD)
                 if not pd.isna(_r.iloc[-1]) and not pd.isna(_w.iloc[-1]):
@@ -1266,9 +1114,8 @@ with tab_paper:
                                 placed_time=str(now))
                 opt_cfg = get_option_config(inst_name)
                 if opt_cfg is not None:
-                    prefix, search_exch, weekly_1letter, min_runway = opt_cfg
-                    chain = find_atm_option(prefix, search_exch, weekly_1letter,
-                                             round(entry_close/100)*100, min_runway)
+                    prefix, search_exch, weekly_1letter = opt_cfg
+                    chain = find_atm_option(prefix, search_exch, weekly_1letter, round(entry_close/100)*100)
                     if chain is not None:
                         bull = last_sig.direction == "bullish"
                         new_pos["option_token"] = chain["ce_token"] if bull else chain["pe_token"]
