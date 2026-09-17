@@ -876,48 +876,6 @@ with tab_paper:
         st.success(f"{inst_name}: closed {pos.get('option_symbol', '')} — {trigger} "
                    f"@ Rs {round(exit_premium, 2)} · P&L Rs {pnl_rs:+,.0f}")
 
-    def _safe_date(s):
-        try:
-            return dt.datetime.fromisoformat(s).date()
-        except (ValueError, TypeError):
-            return None
-
-    def _square_off_all(pp, reason="Stop-All"):
-        from zoneinfo import ZoneInfo as _ZoneInfo
-        _ts_stop = tick_service()
-        _now_stop = dt.datetime.now(_ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-        _closed_count = 0
-        for _inst_name, _pos in list(pp["open"].items()):
-            _tok, _exch, _lot = INSTRUMENTS.get(_inst_name, (None, None, 1))
-            _qty_i = _lot * LOTS_PER_INSTRUMENT.get(_inst_name, 1)
-            if _pos.get("status") != "open":
-                del pp["open"][_inst_name]
-                continue
-            if "option_token" in _pos:
-                _bid, _ask = get_bid_ask(_pos["option_exch"], _pos["option_token"])
-                _exit_px = _bid if _bid is not None else _ts_stop.get_ltp(_pos["option_token"])
-                if _exit_px is not None:
-                    _close_position(pp, _inst_name, _pos, reason, _exit_px, _now_stop, _qty_i)
-                    _closed_count += 1
-                else:
-                    del pp["open"][_inst_name]
-            else:
-                _ltp_u = _ts_stop.get_ltp(_tok) if _tok else None
-                if _ltp_u is not None:
-                    _bull = _pos["dir"] == "bullish"
-                    _pts = round((_ltp_u - _pos["entry"]) if _bull else (_pos["entry"] - _ltp_u), 2)
-                    _pnl_rs = round(_pts * _qty_i, 2)
-                    _pos.update(exit=reason, exit_price=round(_ltp_u, 2), exit_time=str(_now_stop),
-                                points=_pts, pnl_rs=_pnl_rs)
-                    pp["balance"] = round(pp.get("balance", STARTING_CAPITAL) + _pnl_rs, 2)
-                    pp["closed"].append(_pos)
-                    del pp["open"][_inst_name]
-                    _closed_count += 1
-                else:
-                    del pp["open"][_inst_name]
-        save_paper(pp)
-        return _closed_count
-
     if "trading_live" not in st.session_state:
         st.session_state.trading_live = False
 
@@ -965,8 +923,40 @@ with tab_paper:
         st.rerun()
 
     if stop_clicked:
+        from zoneinfo import ZoneInfo as _ZoneInfo
         _pp = load_paper()
-        _closed_count = _square_off_all(_pp, "Stop-All")
+        _ts_stop = tick_service()
+        _now_stop = dt.datetime.now(_ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+        _closed_count = 0
+        for _inst_name, _pos in list(_pp["open"].items()):
+            _tok, _exch, _lot = INSTRUMENTS.get(_inst_name, (None, None, 1))
+            _qty_i = _lot * LOTS_PER_INSTRUMENT.get(_inst_name, 1)
+            if _pos.get("status") != "open":
+                del _pp["open"][_inst_name]
+                continue
+            if "option_token" in _pos:
+                _bid, _ask = get_bid_ask(_pos["option_exch"], _pos["option_token"])
+                _exit_px = _bid if _bid is not None else _ts_stop.get_ltp(_pos["option_token"])
+                if _exit_px is not None:
+                    _close_position(_pp, _inst_name, _pos, "Stop-All", _exit_px, _now_stop, _qty_i)
+                    _closed_count += 1
+                else:
+                    del _pp["open"][_inst_name]
+            else:
+                _ltp_u = _ts_stop.get_ltp(_tok) if _tok else None
+                if _ltp_u is not None:
+                    _bull = _pos["dir"] == "bullish"
+                    _pts = round((_ltp_u - _pos["entry"]) if _bull else (_pos["entry"] - _ltp_u), 2)
+                    _pnl_rs = round(_pts * _qty_i, 2)
+                    _pos.update(exit="Stop-All", exit_price=round(_ltp_u, 2), exit_time=str(_now_stop),
+                                points=_pts, pnl_rs=_pnl_rs)
+                    _pp["balance"] = round(_pp.get("balance", STARTING_CAPITAL) + _pnl_rs, 2)
+                    _pp["closed"].append(_pos)
+                    del _pp["open"][_inst_name]
+                    _closed_count += 1
+                else:
+                    del _pp["open"][_inst_name]
+        save_paper(_pp)
         st.session_state.trading_live = False
         st.success(f"Stopped -- squared off {_closed_count} position(s).")
         st.rerun()
@@ -1002,22 +992,6 @@ with tab_paper:
         ts = tick_service()
         ts.ensure_connected()
 
-        today_date = now.date()
-        _todays_pnl = round(sum((t.get("pnl_rs", 0) or 0) for t in pp["closed"]
-                                 if _safe_date(t.get("exit_time", "")) == today_date), 2)
-        if live_on and DAILY_PROFIT_TARGET > 0 and _todays_pnl >= DAILY_PROFIT_TARGET:
-            if pp["open"]:
-                _n = _square_off_all(pp, "Daily-Target")
-                st.session_state.trading_live = False
-                st.success(f"\U0001F3AF Daily profit target of Rs {DAILY_PROFIT_TARGET:,.0f} reached "
-                           f"(today's realized P&L: Rs {_todays_pnl:,.0f}). Squared off {_n} position(s) "
-                           f"and stopped trading for today.")
-                st.rerun()
-            else:
-                st.session_state.trading_live = False
-                st.info(f"\U0001F3AF Daily profit target of Rs {DAILY_PROFIT_TARGET:,.0f} already reached "
-                        f"(today's realized P&L: Rs {_todays_pnl:,.0f}). Trading stopped for today.")
-
         blocked_total = sum(p.get("capital_blocked", 0) for name, p in pp["open"].items()
                             if p.get("status") == "open" and name in PAPER_INSTRUMENTS)
         _orphans = {name: p.get("capital_blocked", 0) for name, p in pp["open"].items()
@@ -1037,32 +1011,6 @@ with tab_paper:
         if _breakdown:
             st.caption("Capital utilization: " + " · ".join(
                 f"{name}: Rs {amt:,.0f}" for name, amt in _breakdown.items()))
-
-        if pp["closed"]:
-            _cdf_daily = pd.DataFrame(pp["closed"])
-            _cdf_daily["exit_date"] = _cdf_daily["exit_time"].apply(_safe_date)
-            _cdf_daily = _cdf_daily.dropna(subset=["exit_date"])
-            if not _cdf_daily.empty:
-                _daily_grp = _cdf_daily.groupby("exit_date").agg(
-                    trades=("pnl_rs", "count"),
-                    win_rate=("pnl_rs", lambda s: round(100 * (s > 0).mean())),
-                    day_pnl=("pnl_rs", "sum"),
-                ).reset_index().sort_values("exit_date", ascending=False)
-                _daily_grp["day_pnl"] = _daily_grp["day_pnl"].round(2)
-
-                _today_row = _daily_grp[_daily_grp["exit_date"] == now.date()]
-                _today_total = float(_today_row["day_pnl"].iloc[0]) if not _today_row.empty else 0.0
-                _dm1, _dm2 = st.columns([1, 3])
-                _dm1.metric("Today's P&L", f"Rs {_today_total:+,.0f}", delta=f"{_today_total:+,.0f}")
-
-                with st.expander(f"Daily P&L history ({len(_daily_grp)} day(s))"):
-                    _disp = _daily_grp.rename(columns={"exit_date": "Date", "trades": "Trades",
-                                                        "win_rate": "Win %", "day_pnl": "Day P&L (Rs)"})
-                    try:
-                        _styled_daily = _disp.style.map(_pnl_color, subset=["Day P&L (Rs)"])
-                    except AttributeError:
-                        _styled_daily = _disp.style.applymap(_pnl_color, subset=["Day P&L (Rs)"])
-                    st.dataframe(_styled_daily, use_container_width=True, hide_index=True)
 
         st.caption(f"Strategy: **{STRATEGY}** · Instruments: **{', '.join(PAPER_INSTRUMENTS)}**")
 
@@ -1280,15 +1228,6 @@ with tab_paper:
                     except Exception:
                         pass
                 continue
-
-            if MAX_TRADES_PER_DAY > 0:
-                _today_count = sum(1 for t in pp["closed"]
-                                    if t.get("instrument") == inst_name
-                                    and _safe_date(t.get("exit_time", "")) == now.date())
-                if _today_count >= MAX_TRADES_PER_DAY:
-                    st.caption(f"{inst_name}: daily trade limit reached "
-                               f"({_today_count}/{MAX_TRADES_PER_DAY}) -- not scanning for more today.")
-                    continue
 
             time.sleep(1.5)
             try:
