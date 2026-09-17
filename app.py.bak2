@@ -1,0 +1,404 @@
+"""SMC Trading Dashboard — backtest, paper trade, live.
+
+Run:  streamlit run app.py
+Requires smc.py in the same folder.
+"""
+from dotenv import load_dotenv
+load_dotenv()
+
+import os, json, time, datetime as dt
+import pandas as pd, numpy as np
+import streamlit as st
+import plotly.graph_objects as go
+from smartmoneyconcepts import smc
+
+st.set_page_config(page_title="SMC Dashboard", layout="wide")
+
+PAPER_FILE = "paper_positions.json"
+
+
+# ---------------------------------------------------------------- broker
+@st.cache_resource
+def broker():
+    import pyotp
+    from SmartApi import SmartConnect
+    o = SmartConnect(api_key=os.environ["ANGEL_API_KEY"])
+    o.generateSession(os.environ["ANGEL_CLIENT_ID"],
+                      os.environ["ANGEL_PASSWORD"],
+                      pyotp.TOTP(os.environ["ANGEL_TOTP"]).now())
+    return o
+
+
+@st.cache_data(ttl=300, show_spinner="fetching candles…")
+def fetch(frm, to, interval, token="99926000", exch="NSE"):
+    import time as _t
+    a = pd.to_datetime(frm); b = pd.to_datetime(to)
+    span = 45 if interval in ("ONE_MINUTE", "THREE_MINUTE") else 90
+    parts, cur = [], a
+    while cur < b:
+        end = min(cur + pd.Timedelta(days=span), b)
+        r = broker().getCandleData(dict(exchange=exch, symboltoken=token,
+                                        interval=interval,
+                                        fromdate=cur.strftime("%Y-%m-%d %H:%M"),
+                                        todate=end.strftime("%Y-%m-%d %H:%M")))
+        if r.get("data"):
+            parts.append(pd.DataFrame(r["data"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"]))
+        cur = end + pd.Timedelta(minutes=1)
+        _t.sleep(2)
+    if not parts:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    df = pd.concat(parts).drop_duplicates("timestamp")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- strategy
+def signals(df, swing_length, close_break):
+    ohlc = df[["open", "high", "low", "close", "volume"]].astype(float)
+    sw = smc.swing_highs_lows(ohlc, swing_length=swing_length)
+    bc = smc.bos_choch(ohlc, sw, close_break=close_break)
+    s = bc[bc.BOS.notna() | bc.CHOCH.notna()].copy()
+    if s.empty:
+        return sw, s
+    s["type"] = np.where(s.CHOCH.notna(), "CHoCH", "BOS")
+    v = s[["BOS", "CHOCH"]].bfill(axis=1).iloc[:, 0]
+    s["direction"] = np.where(v > 0, "bullish", "bearish")
+    s["broken_i"] = s.BrokenIndex.astype(int)
+    return sw, s
+
+
+def run_backtest(df, sig, rr, which):
+    use = sig if which == "both" else sig[sig.type == which]
+    out = []
+    for _, e in use.iterrows():
+        i = e.broken_i + 1                       # entry AFTER the break
+        if i >= len(df):
+            continue
+        entry = df.loc[i, "open"]
+        bull = e.direction == "bullish"
+        sl = e.Level
+        risk = (entry - sl) if bull else (sl - entry)
+        if risk <= 0:
+            continue
+        tgt = entry + rr * risk if bull else entry - rr * risk
+
+        day, res, px, j = df.loc[i, "timestamp"].date(), None, None, i
+        for j in range(i, len(df)):
+            if df.loc[j, "timestamp"].date() != day:
+                break
+            h, l = df.loc[j, "high"], df.loc[j, "low"]
+            if bull:
+                if l <= sl:  res, px = "SL", sl; break
+                if h >= tgt: res, px = "Target", tgt; break
+            else:
+                if h >= sl:  res, px = "SL", sl; break
+                if l <= tgt: res, px = "Target", tgt; break
+        if res is None:
+            res, px = "EOD", df.loc[j, "close"]
+        out.append(dict(time=df.loc[i, "timestamp"], dir=e.direction, type=e.type,
+                        entry=round(entry, 2), sl=round(sl, 2), target=round(tgt, 2),
+                        exit=res, exit_price=round(px, 2),
+                        points=round((px - entry) if bull else (entry - px), 2),
+                        risk=round(risk, 2)))
+    return pd.DataFrame(out)
+
+
+def chart(df, sw, sig, days, swing_length):
+    m = df.timestamp >= df.timestamp.max() - pd.Timedelta(days=days)
+    r, s = df[m], sw[m]
+    f = go.Figure(go.Candlestick(x=r.timestamp, open=r.open, high=r.high,
+                                 low=r.low, close=r.close, name="NIFTY"))
+    hi, lo = r[s.HighLow == 1], r[s.HighLow == -1]
+    f.add_scatter(x=hi.timestamp, y=hi.high, mode="markers", name="swing high",
+                  marker=dict(symbol="triangle-down", size=10, color="#c0392b"))
+    f.add_scatter(x=lo.timestamp, y=lo.low, mode="markers", name="swing low",
+                  marker=dict(symbol="triangle-up", size=10, color="#27ae60"))
+    if not sig.empty:
+        for _, e in sig.iterrows():
+            if e.broken_i < len(df):
+                bt = df.loc[e.broken_i, "timestamp"]
+                if bt in set(r.timestamp):
+                    f.add_annotation(x=bt, y=e.Level, text=e.type, showarrow=True,
+                                     arrowhead=2, font=dict(size=9, color="white"),
+                                     bgcolor="#e67e22" if e.type == "CHoCH" else "#7f8c8d")
+    f.update_xaxes(rangebreaks=[
+        dict(bounds=["sat", "mon"]),
+        dict(bounds=[15.5, 9.25], pattern="hour"),
+    ])
+    f.update_layout(height=600, xaxis_rangeslider_visible=False,
+                    margin=dict(t=30, b=20), title=f"SWING_LENGTH={swing_length}")
+    return f
+
+
+# ---------------------------------------------------------------- paper store
+def load_paper():
+    if os.path.exists(PAPER_FILE):
+        return json.load(open(PAPER_FILE))
+    return {"open": [], "closed": []}
+
+
+def save_paper(d):
+    json.dump(d, open(PAPER_FILE, "w"), indent=1, default=str)
+
+
+# ---------------------------------------------------------------- sidebar
+st.sidebar.header("Strategy")
+SWING = st.sidebar.slider("Swing length", 3, 60, 20, 1,
+                          help="Candles either side defining a swing. Tune this on the CHART, not the P&L.")
+SIGNAL = st.sidebar.selectbox("Signal", ["BOS", "CHoCH", "both"], index=0)
+RR = st.sidebar.slider("Risk : Reward", 0.5, 5.0, 2.0, 0.5)
+CLOSE_BREAK = st.sidebar.checkbox("Confirm break on close", True)
+INSTRUMENTS = {
+    "NIFTY 50":        ("99926000", "NSE", 65),
+    "NIFTY BANK":      ("99926009", "NSE", 35),
+    "FINNIFTY":        ("99926037", "NSE", 65),
+    "MIDCPNIFTY":      ("99926074", "NSE", 120),
+    "CRUDEOIL Sep26":  ("565899",   "MCX", 100),
+    "CRUDEOIL Oct26":  ("569900",   "MCX", 100),
+}
+INST = st.sidebar.selectbox("Instrument", list(INSTRUMENTS))
+TOKEN, EXCH, LOT = INSTRUMENTS[INST]
+if EXCH == "MCX":
+    st.sidebar.warning("MCX futures expire monthly. History is limited to this "
+                       "contract's life, and stitching contracts creates fake "
+                       "price jumps that look like real breaks.")
+
+INTERVAL = st.sidebar.selectbox("Interval",
+                                ["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE"], 2)
+st.sidebar.divider()
+st.sidebar.subheader("Capital")
+LOTSIZE = st.sidebar.number_input("Lot size (exchange)", 1, 5000, LOT, 1,
+    key=f"lotsize_{INST}",
+    help="Fixed by the exchange - NIFTY 65, BANKNIFTY 35, CRUDEOIL 100. "
+         "Only change it if the exchange revises the contract.")
+LOTS = st.sidebar.number_input("Number of lots", 1, 50, 1, 1, key="lots",
+    help="How many contracts you buy. This is the one you control.")
+QTY = LOTSIZE * LOTS
+LOT = QTY
+st.sidebar.success(f"**Quantity: {QTY:,}**  ({LOTSIZE} x {LOTS} lots)")
+
+st.sidebar.divider()
+st.sidebar.subheader("Option buying")
+OPT_MODE = st.sidebar.checkbox("Simulate option buying", True)
+PREMIUM = st.sidebar.number_input("ATM premium (Rs)", 20, 500, 140, 10)
+DELTA = st.sidebar.slider("Delta", 0.3, 0.8, 0.5, 0.05)
+THETA_HR = st.sidebar.slider("Theta (pts/hour)", 0.0, 10.0, 3.0, 0.5)
+SPREAD = st.sidebar.slider("Spread (pts/trade)", 0.0, 5.0, 1.0, 0.25)
+st.sidebar.divider()
+
+COST_PTS = st.sidebar.number_input("Cost per trade (points)", 0.0, 20.0, 2.0, 0.5,
+                                   help="Brokerage + STT + slippage. Be pessimistic.")
+
+st.sidebar.caption("Validated config: swing 20, BOS, RR 2.0 — the only one that "
+                   "survived out-of-sample testing.")
+
+tab_bt, tab_paper, tab_live = st.tabs(["Backtest", "Paper trading", "Live"])
+
+
+# ---------------------------------------------------------------- backtest
+with tab_bt:
+    c1, c2 = st.columns(2)
+    frm = c1.date_input("From", dt.date(2026, 6, 1))
+    to = c2.date_input("To", dt.date(2026, 9, 10))
+
+    if st.button("Run backtest", type="primary"):
+        df = fetch(f"{frm} 09:15", f"{to} 15:30", INTERVAL, TOKEN, EXCH)
+        sw, sig = signals(df, SWING, CLOSE_BREAK)
+        st.session_state.bt = (df, sw, sig, run_backtest(df, sig, RR, SIGNAL))
+
+    if "bt" in st.session_state:
+        df, sw, sig, t = st.session_state.bt
+        st.caption(f"{len(df):,} candles · {df.timestamp.min():%d %b %Y} → {df.timestamp.max():%d %b %Y}")
+
+        st.subheader("Structure")
+        st.info("Check this first. If the triangles aren't on the highs and lows "
+                "you'd pick by eye, change Swing length — the numbers below are "
+                "meaningless until the structure looks right.")
+        st.plotly_chart(chart(df, sw, sig, st.slider("Days shown", 2, 30, 7), SWING),
+                        use_container_width=True)
+
+        st.subheader("Results")
+        if t.empty:
+            st.warning("No trades for these settings.")
+        else:
+            gross = t.points.sum()
+            if OPT_MODE:
+                hrs = t["hours"] if "hours" in t.columns else pd.Series(2.0, index=t.index)
+                t = t.assign(opt_points=(t.points*DELTA - hrs*THETA_HR - SPREAD).round(2))
+                gross = t.opt_points.sum()
+                st.warning("**Option-buying model** - index moves converted via "
+                           "delta, theta and spread. An approximation, not real "
+                           "option prices.")
+            pc = t.opt_points if OPT_MODE else t.points
+            net = gross - COST_PTS * len(t)
+            h = len(t) // 2
+            h1, h2 = t.points[:h].sum(), t.points[h:].sum()
+            eq = t.points.cumsum()
+
+            k = st.columns(5)
+            k[0].metric("Trades", len(t))
+            k[1].metric("Win rate", f"{100*(t.points>0).mean():.0f}%")
+            k[2].metric("Gross", f"{gross:+.0f} pts")
+            k[3].metric(f"Net @ {COST_PTS}", f"{net:+.0f} pts", f"Rs {net*LOT:+,.0f}")
+
+            _eq = pc.cumsum(); _dd = (_eq - _eq.cummax()).min()
+            _per = (PREMIUM*QTY) if OPT_MODE else 0
+            _ddrs = abs(_dd*LOT)
+            st.subheader("Capital required")
+            cc = st.columns(3)
+            cc[0].metric("Per trade", f"Rs {_per:,.0f}")
+            cc[1].metric("Drawdown buffer", f"Rs {_ddrs:,.0f}")
+            cc[2].metric("Minimum capital", f"Rs {_per + _ddrs:,.0f}")
+            st.caption(f"Comfortable: Rs {_per + 2*_ddrs:,.0f}. If one drawdown "
+                       "costs more than ~25% of your account, the size is too big.")
+            k[4].metric("Max DD", f"{(eq-eq.cummax()).min():.0f} pts")
+
+            if h1 > 0 and h2 > 0:
+                st.success(f"Both halves positive ({h1:+.0f} / {h2:+.0f}) — consistent so far.")
+            else:
+                st.error(f"First half {h1:+.0f}, second half {h2:+.0f}. "
+                         "Only one half positive means this is fitted to that period, not an edge.")
+
+            st.plotly_chart(go.Figure(go.Scatter(y=eq, mode="lines"))
+                            .update_layout(height=260, title="Equity (points)",
+                                           margin=dict(t=40, b=20)),
+                            use_container_width=True)
+            st.dataframe(t, use_container_width=True, height=300)
+
+
+# ---------------------------------------------------------------- paper
+with tab_paper:
+    st.subheader("Paper trading — live")
+    st.caption("Only acts on signals from the most recently closed candle, entered at "
+               "current market price. Historical/untraded old signals are ignored. "
+               "No real orders are sent. One position at a time.")
+
+    top = st.columns([1, 1, 2])
+    live_on = top[0].toggle("Live", value=True, help="Turn off to pause auto-refresh")
+    REFRESH_SECONDS = top[1].number_input("Refresh (sec)", 30, 600, 60, 15,
+                                           help="Keep this at 60+ to avoid broker rate limits.")
+    if top[2].button("Reset paper account"):
+        save_paper({"open": [], "closed": []})
+        st.rerun()
+
+    @st.fragment(run_every=REFRESH_SECONDS if live_on else None)
+    def live_panel():
+        from zoneinfo import ZoneInfo
+        pp = load_paper()
+        now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+        status = st.empty()
+
+        if pp["open"]:
+            p = pp["open"][0]
+            try:
+                df = fetch((now - dt.timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M"),
+                           now.strftime("%Y-%m-%d %H:%M"), "ONE_MINUTE", TOKEN, EXCH)
+            except Exception as e:
+                status.error(f"Broker call failed: {e}")
+                df = pd.DataFrame()
+
+            if df.empty:
+                status.warning("No live price data returned yet — market may be closed.")
+            else:
+                ltp = float(df.iloc[-1].close)
+                bull = p["dir"] == "bullish"
+                hit_sl = ltp <= p["sl"] if bull else ltp >= p["sl"]
+                hit_tg = ltp >= p["target"] if bull else ltp <= p["target"]
+                pts = round((ltp - p["entry"]) if bull else (p["entry"] - ltp), 2)
+
+                if hit_sl or hit_tg:
+                    exit_px = p["sl"] if hit_sl else p["target"]
+                    p.update(exit="SL" if hit_sl else "Target", exit_price=exit_px,
+                             exit_time=str(now),
+                             points=round((exit_px - p["entry"]) if bull else (p["entry"] - exit_px), 2))
+                    pp["closed"].append(p)
+                    pp["open"] = []
+                    save_paper(pp)
+                    st.success(f"Position closed — {p['exit']} @ {exit_px}")
+                else:
+                    st.markdown("### Open position")
+                    c = st.columns(6)
+                    c[0].metric("Direction", p["dir"].capitalize())
+                    c[1].metric("Entry", p["entry"])
+                    c[2].metric("LTP", ltp)
+                    c[3].metric("P&L (pts)", f"{pts:+.2f}")
+                    c[4].metric("P&L (Rs)", f"{pts*QTY:+,.0f}")
+                    c[5].metric("Type", p["type"])
+                    st.caption(f"SL {p['sl']} · Target {p['target']} · opened {p['time']}")
+        else:
+            try:
+                df = fetch((now - dt.timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
+                           now.strftime("%Y-%m-%d %H:%M"), INTERVAL, TOKEN, EXCH)
+            except Exception as e:
+                status.error(f"Broker call failed: {e}")
+                df = pd.DataFrame()
+
+            if df.empty or len(df) < 3:
+                status.warning("Not enough candle data returned yet.")
+            else:
+                sw, sig = signals(df, SWING, CLOSE_BREAK)
+                use = sig if SIGNAL == "both" else sig[sig.type == SIGNAL]
+
+                opened = False
+                if not use.empty:
+                    last_sig = use.iloc[-1]
+                    is_fresh = last_sig.broken_i >= len(df) - 2
+                    already_used = str(df.iloc[-1].timestamp) in {c.get("signal_ts") for c in pp["closed"]}
+                    if is_fresh and not already_used:
+                        entry = float(df.iloc[-1].close)
+                        bull = last_sig.direction == "bullish"
+                        sl = last_sig.Level
+                        risk = (entry - sl) if bull else (sl - entry)
+                        if risk > 0:
+                            pp["open"] = [dict(
+                                time=str(now), signal_ts=str(df.iloc[-1].timestamp),
+                                dir=last_sig.direction, type=last_sig.type,
+                                entry=round(entry, 2), sl=round(sl, 2),
+                                target=round(entry + RR*risk if bull else entry - RR*risk, 2),
+                            )]
+                            save_paper(pp)
+                            opened = True
+
+                if opened:
+                    st.rerun()
+                else:
+                    st.info("No open position — watching for a fresh BOS/CHoCH signal…")
+
+        status.caption(f"Last checked {now:%d %b %H:%M:%S}" + (" · live" if live_on else " · paused"))
+
+        st.markdown("**Closed trades**")
+        if pp["closed"]:
+            c = pd.DataFrame(pp["closed"])
+            tot = c.points.sum()
+            m = st.columns(4)
+            m[0].metric("Trades", len(c))
+            m[1].metric("Win rate", f"{100*(c.points>0).mean():.0f}%")
+            m[2].metric("Gross", f"{tot:+.1f} pts")
+            m[3].metric(f"Net @ {COST_PTS}", f"Rs {(tot-COST_PTS*len(c))*LOT:+,.0f}")
+            st.dataframe(c, use_container_width=True)
+        else:
+            st.caption("No closed paper trades yet.")
+
+    live_panel()
+
+with tab_live:
+    st.subheader("Live trading")
+    st.error("**Not enabled.** This strategy has one out-of-sample result behind it. "
+             "That is not enough evidence to risk money.")
+
+    st.markdown("""
+Before wiring real orders, all of these should be true:
+
+- **Several months of paper trading** on the Paper tab, with results that match
+  the backtest. If paper and backtest disagree, the backtest is wrong.
+- **Walk-forward validation**, not just the single split already run.
+- **Costs measured, not estimated** — from your actual AngelOne contract notes.
+- **A daily loss limit you will not override.** Decide it now, while nothing is
+  at stake.
+
+If all of that holds, order placement goes here — `obj.placeOrder(...)`. It's
+deliberately not written yet, because an untested strategy with a working order
+button is how accounts get damaged.
+    """)
+    st.caption("Ask me to add order placement once the paper results are in.")

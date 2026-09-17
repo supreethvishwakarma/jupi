@@ -1,0 +1,788 @@
+"""SMC / ORB Trading Dashboard — backtest, paper trade, chart, live.
+
+Run: streamlit run app.py
+
+Requires smc.py in the same folder.
+"""
+from dotenv import load_dotenv
+load_dotenv()
+
+import os, json, time, datetime as dt
+import pandas as pd, numpy as np
+import streamlit as st
+import plotly.graph_objects as go
+from smartmoneyconcepts import smc
+
+st.set_page_config(page_title="Trading Dashboard", layout="wide")
+
+PAPER_FILE = "paper_positions.json"
+
+# ---------------------------------------------------------------- broker
+
+@st.cache_resource
+def broker():
+    import pyotp
+    from SmartApi import SmartConnect
+    o = SmartConnect(api_key=os.environ["ANGEL_API_KEY"])
+    o.generateSession(os.environ["ANGEL_CLIENT_ID"],
+                       os.environ["ANGEL_PASSWORD"],
+                       pyotp.TOTP(os.environ["ANGEL_TOTP"]).now())
+    return o
+
+@st.cache_data(ttl=300, show_spinner="fetching candles…")
+def fetch(frm, to, interval, token="99926000", exch="NSE"):
+    import time as _t
+    a = pd.to_datetime(frm); b = pd.to_datetime(to)
+    span = 45 if interval in ("ONE_MINUTE", "THREE_MINUTE") else 90
+    parts, cur = [], a
+    while cur < b:
+        end = min(cur + pd.Timedelta(days=span), b)
+        r = broker().getCandleData(dict(exchange=exch, symboltoken=token,
+                                          interval=interval,
+                                          fromdate=cur.strftime("%Y-%m-%d %H:%M"),
+                                          todate=end.strftime("%Y-%m-%d %H:%M")))
+        if r.get("data"):
+            parts.append(pd.DataFrame(r["data"],
+                          columns=["timestamp", "open", "high", "low", "close", "volume"]))
+        cur = end + pd.Timedelta(minutes=1)
+        _t.sleep(2)
+    if not parts:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.concat(parts).drop_duplicates("timestamp")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+@st.cache_resource
+def tick_service():
+    """Background WebSocket connection to AngelOne, giving real-time LTP ticks
+    without touching the REST historical-data rate limit at all."""
+    import threading, time as _time
+    import pyotp
+    from SmartApi import SmartConnect
+    from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+    class TickService:
+        def __init__(self):
+            self.latest = {}
+            self.subscribed = set()
+            self.lock = threading.Lock()
+            self.ready = False
+            self.sws = None
+            self._connect()
+
+        def _connect(self):
+            api_key = os.environ["ANGEL_API_KEY"]
+            client_id = os.environ["ANGEL_CLIENT_ID"]
+            o = SmartConnect(api_key=api_key)
+            data = o.generateSession(client_id, os.environ["ANGEL_PASSWORD"],
+                                      pyotp.TOTP(os.environ["ANGEL_TOTP"]).now())
+            auth_token = data["data"]["jwtToken"]
+            feed_token = o.getfeedToken()
+            self.sws = SmartWebSocketV2(auth_token, api_key, client_id, feed_token,
+                                         max_retry_attempt=5)
+
+            def on_data(wsapp, message):
+                token = message.get("token")
+                ltp = message.get("last_traded_price")
+                if token is not None and ltp is not None:
+                    with self.lock:
+                        self.latest[str(token)] = {"ltp": ltp / 100.0, "ts": _time.time()}
+
+            def on_open(wsapp):
+                self.ready = True
+
+            def on_error(wsapp, error):
+                pass
+
+            def on_close(wsapp):
+                self.ready = False
+
+            self.sws.on_data = on_data
+            self.sws.on_open = on_open
+            self.sws.on_error = on_error
+            self.sws.on_close = on_close
+            threading.Thread(target=self.sws.connect, daemon=True).start()
+
+        def ensure_subscribed(self, exch, token):
+            key = (exch, str(token))
+            if key in self.subscribed or not self.ready:
+                return
+            exch_map = {"NSE": 1, "NFO": 2, "BSE": 3, "MCX": 5}
+            etype = exch_map.get(exch, 1)
+            try:
+                self.sws.subscribe("live_chart", 1, [{"exchangeType": etype, "tokens": [str(token)]}])
+                self.subscribed.add(key)
+            except Exception:
+                pass
+
+        def get_ltp(self, token):
+            with self.lock:
+                d = self.latest.get(str(token))
+                return d["ltp"] if d else None
+
+    return TickService()
+
+
+@st.cache_data(ttl=35)
+def get_bucketed_candles(token, exch, interval, bucket, days=2):
+    """REST candle history, refetched at most every ~30s (via the bucket key)
+    regardless of how often the caller runs -- keeps the fast tick-driven chart
+    loop from ever hitting the historical-data rate limit."""
+    from zoneinfo import ZoneInfo
+    now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+    return fetch((now - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+                 now.strftime("%Y-%m-%d %H:%M"), interval, token, exch)
+
+# ---------------------------------------------------------------- strategies
+
+def signals(df, swing_length, close_break):
+    """SMC: Break of Structure / Change of Character."""
+    ohlc = df[["open", "high", "low", "close", "volume"]].astype(float)
+    sw = smc.swing_highs_lows(ohlc, swing_length=swing_length)
+    bc = smc.bos_choch(ohlc, sw, close_break=close_break)
+    s = bc[bc.BOS.notna() | bc.CHOCH.notna()].copy()
+    if s.empty:
+        return sw, pd.DataFrame(columns=["type", "direction", "broken_i", "Level"])
+    s["type"] = np.where(s.CHOCH.notna(), "CHoCH", "BOS")
+    v = s[["BOS", "CHOCH"]].bfill(axis=1).iloc[:, 0]
+    s["direction"] = np.where(v > 0, "bullish", "bearish")
+    s["broken_i"] = s.BrokenIndex.astype(int)
+    return sw, s
+
+
+def orb_signals(df, or_bars=1):
+    """Opening Range Breakout: the first `or_bars` candles of each trading day
+    set the range (high/low). The first later candle whose CLOSE breaks beyond
+    that range is the breakout signal for that day (one signal per day, first
+    breakout only, classic ORB rule)."""
+    d = df.copy()
+    d["date"] = d["timestamp"].dt.date
+    rows = []
+    for day, g in d.groupby("date"):
+        if len(g) <= or_bars:
+            continue
+        opening = g.iloc[:or_bars]
+        or_high, or_low = float(opening["high"].max()), float(opening["low"].min())
+        for idx, row in g.iloc[or_bars:].iterrows():
+            if row["close"] > or_high:
+                rows.append(dict(type="ORB", direction="bullish", broken_i=idx, Level=or_low))
+                break
+            elif row["close"] < or_low:
+                rows.append(dict(type="ORB", direction="bearish", broken_i=idx, Level=or_high))
+                break
+    return pd.DataFrame(rows, columns=["type", "direction", "broken_i", "Level"])
+
+
+def get_signals(df):
+    """Dispatches to whichever strategy is selected in the sidebar."""
+    if STRATEGY == "SMC BOS/CHoCH":
+        return signals(df, SWING, CLOSE_BREAK)
+    return None, orb_signals(df, OR_BARS)
+
+
+def run_backtest(df, sig, rr, which):
+    use = sig if (sig.empty or which == "both") else sig[sig.type == which]
+    out = []
+    for _, e in use.iterrows():
+        i = e.broken_i + 1  # entry AFTER the break
+        if i >= len(df):
+            continue
+        entry = df.loc[i, "open"]
+        bull = e.direction == "bullish"
+        sl = e.Level
+        risk = (entry - sl) if bull else (sl - entry)
+        if risk <= 0:
+            continue
+        tgt = entry + rr * risk if bull else entry - rr * risk
+        day, res, px, j = df.loc[i, "timestamp"].date(), None, None, i
+        for j in range(i, len(df)):
+            if df.loc[j, "timestamp"].date() != day:
+                break
+            h, l = df.loc[j, "high"], df.loc[j, "low"]
+            if bull:
+                if l <= sl: res, px = "SL", sl; break
+                if h >= tgt: res, px = "Target", tgt; break
+            else:
+                if h >= sl: res, px = "SL", sl; break
+                if l <= tgt: res, px = "Target", tgt; break
+        if res is None:
+            res, px = "EOD", df.loc[j, "close"]
+        out.append(dict(time=df.loc[i, "timestamp"], dir=e.direction, type=e.type,
+                         entry=round(entry, 2), sl=round(sl, 2), target=round(tgt, 2),
+                         exit=res, exit_price=round(px, 2),
+                         points=round((px - entry) if bull else (entry - px), 2),
+                         risk=round(risk, 2)))
+    return pd.DataFrame(out)
+
+
+def chart(df, sw, sig, days, label):
+    m = df.timestamp >= df.timestamp.max() - pd.Timedelta(days=days)
+    r = df[m]
+    f = go.Figure(go.Candlestick(x=r.timestamp, open=r.open, high=r.high,
+                  low=r.low, close=r.close, name="Price"))
+    if sw is not None:
+        s = sw[m]
+        hi, lo = r[s.HighLow == 1], r[s.HighLow == -1]
+        f.add_scatter(x=hi.timestamp, y=hi.high, mode="markers", name="swing high",
+                      marker=dict(symbol="triangle-down", size=10, color="#c0392b"))
+        f.add_scatter(x=lo.timestamp, y=lo.low, mode="markers", name="swing low",
+                      marker=dict(symbol="triangle-up", size=10, color="#27ae60"))
+    if not sig.empty:
+        for _, e in sig.iterrows():
+            if e.broken_i < len(df):
+                bt = df.loc[e.broken_i, "timestamp"]
+                if bt in set(r.timestamp):
+                    f.add_annotation(x=bt, y=e.Level, text=e.type, showarrow=True,
+                                      arrowhead=2, font=dict(size=9, color="white"),
+                                      bgcolor="#e67e22" if e.type == "CHoCH" else "#7f8c8d")
+    f.update_xaxes(rangebreaks=[
+        dict(bounds=["sat", "mon"]),
+        dict(bounds=[15.5, 9.25], pattern="hour"),
+    ])
+    f.update_layout(height=600, xaxis_rangeslider_visible=False,
+                     margin=dict(t=30, b=20), title=label)
+    return f
+
+# ---------------------------------------------------------------- paper store
+
+def load_paper():
+    if os.path.exists(PAPER_FILE):
+        d = json.load(open(PAPER_FILE))
+        d.setdefault("ignored", [])
+        d.setdefault("balance", STARTING_CAPITAL)
+        return d
+    return {"open": [], "closed": [], "ignored": [], "balance": STARTING_CAPITAL}
+
+
+def save_paper(d):
+    json.dump(d, open(PAPER_FILE, "w"), indent=1, default=str)
+
+
+@st.cache_data(ttl=3600, show_spinner="looking up current MCX CRUDEOIL contracts…")
+def lookup_crude_contracts():
+    """Looks up the real, currently-listed MCX CRUDEOIL futures contracts from
+    AngelOne's own scrip master, instead of trusting hardcoded tokens that go
+    stale every month when contracts roll over."""
+    try:
+        res = broker().searchScrip("MCX", "CRUDEOIL")
+    except Exception:
+        return []
+    if not res.get("status"):
+        return []
+    rows = [r for r in res.get("data", [])
+            if r["tradingsymbol"].startswith("CRUDEOIL")
+            and r["tradingsymbol"].endswith("FUT")
+            and not r["tradingsymbol"].startswith("CRUDEOILM")]
+
+    def parse_expiry(sym):
+        core = sym[len("CRUDEOIL"):-len("FUT")]  # e.g. "19SEP26"
+        try:
+            return dt.datetime.strptime(core, "%d%b%y")
+        except ValueError:
+            return dt.datetime.max
+
+    rows.sort(key=lambda r: parse_expiry(r["tradingsymbol"]))
+    return rows[:2]
+
+# ---------------------------------------------------------------- sidebar
+
+st.sidebar.header("Strategy")
+STRATEGY = st.sidebar.selectbox("Strategy", ["SMC BOS/CHoCH", "ORB 5-Min Breakout"], index=0)
+
+if STRATEGY == "SMC BOS/CHoCH":
+    SWING = st.sidebar.slider("Swing length", 3, 60, 20, 1,
+                               help="Candles either side defining a swing. Tune this on the CHART, not the P&L.")
+    SIGNAL = st.sidebar.selectbox("Signal", ["BOS", "CHoCH", "both"], index=0)
+    CLOSE_BREAK = st.sidebar.checkbox("Confirm break on close", True)
+    OR_BARS = 1
+else:
+    OR_BARS = st.sidebar.number_input("Opening range candles", 1, 6, 1, 1,
+                                       help="How many candles from the day's open define the range. "
+                                            "1 candle = first 5 minutes on a 5-min chart (classic ORB).")
+    SWING = 20
+    SIGNAL = "both"
+    CLOSE_BREAK = True
+
+RR = st.sidebar.slider("Risk : Reward", 0.5, 5.0, 2.0, 0.5)
+
+INSTRUMENTS = {
+    "NIFTY 50": ("99926000", "NSE", 65),
+    "NIFTY BANK": ("99926009", "NSE", 35),
+    "FINNIFTY": ("99926037", "NSE", 65),
+    "MIDCPNIFTY": ("99926074", "NSE", 120),
+}
+_crude = lookup_crude_contracts()
+for r in _crude:
+    INSTRUMENTS[r["tradingsymbol"]] = (r["symboltoken"], "MCX", 100)
+if not _crude:
+    st.sidebar.caption("Couldn't look up live CRUDEOIL contracts (broker call failed) -- "
+                        "MCX instruments unavailable this session.")
+INST = st.sidebar.selectbox("Instrument", list(INSTRUMENTS))
+TOKEN, EXCH, LOT = INSTRUMENTS[INST]
+
+if EXCH == "MCX":
+    st.sidebar.warning("MCX futures expire monthly. History is limited to this "
+                        "contract's life, and stitching contracts creates fake "
+                        "price jumps that look like real breaks.")
+
+INTERVAL = st.sidebar.selectbox("Interval",
+    ["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE"], 2)
+
+st.sidebar.divider()
+st.sidebar.subheader("Capital")
+LOTSIZE = st.sidebar.number_input("Lot size (exchange)", 1, 5000, LOT, 1,
+                                   key=f"lotsize_{INST}",
+                                   help="Fixed by the exchange - NIFTY 65, BANKNIFTY 35, CRUDEOIL 100. "
+                                        "Only change it if the exchange revises the contract.")
+LOTS = st.sidebar.number_input("Number of lots", 1, 50, 1, 1, key="lots",
+                                help="How many contracts you buy. This is the one you control.")
+QTY = LOTSIZE * LOTS
+LOT = QTY
+st.sidebar.success(f"**Quantity: {QTY:,}** ({LOTSIZE} x {LOTS} lots)")
+
+st.sidebar.divider()
+st.sidebar.subheader("Option buying")
+OPT_MODE = st.sidebar.checkbox("Simulate option buying", True)
+PREMIUM = st.sidebar.number_input("ATM premium (Rs)", 20, 500, 140, 10)
+DELTA = st.sidebar.slider("Delta", 0.3, 0.8, 0.5, 0.05)
+THETA_HR = st.sidebar.slider("Theta (pts/hour)", 0.0, 10.0, 3.0, 0.5)
+SPREAD = st.sidebar.slider("Spread (pts/trade)", 0.0, 5.0, 1.0, 0.25)
+
+st.sidebar.divider()
+COST_PTS = st.sidebar.number_input("Cost per trade (points)", 0.0, 20.0, 2.0, 0.5,
+                                    help="Brokerage + STT + slippage. Be pessimistic.")
+st.sidebar.caption("Only the original SMC config (swing 20, BOS, RR 2.0) has been "
+                    "out-of-sample tested. ORB is new — validate it on the Backtest "
+                    "tab across several date ranges before trusting it in paper trading.")
+
+tab_bt, tab_paper, tab_chart, tab_live = st.tabs(["Backtest", "Paper trading", "Chart", "Live"])
+
+# ---------------------------------------------------------------- backtest
+
+with tab_bt:
+    c1, c2 = st.columns(2)
+    frm = c1.date_input("From", dt.date(2026, 6, 1))
+    to = c2.date_input("To", dt.date(2026, 9, 10))
+    if st.button("Run backtest", type="primary"):
+        df = fetch(f"{frm} 09:15", f"{to} 15:30", INTERVAL, TOKEN, EXCH)
+        sw, sig = get_signals(df)
+        which = SIGNAL if STRATEGY == "SMC BOS/CHoCH" else "both"
+        st.session_state.bt = (df, sw, sig, run_backtest(df, sig, RR, which))
+
+    if "bt" in st.session_state:
+        df, sw, sig, t = st.session_state.bt
+        st.caption(f"{len(df):,} candles · {df.timestamp.min():%d %b %Y} → {df.timestamp.max():%d %b %Y}")
+
+        st.subheader("Structure")
+        if STRATEGY == "SMC BOS/CHoCH":
+            st.info("Check this first. If the triangles aren't on the highs and lows "
+                    "you'd pick by eye, change Swing length — the numbers below are "
+                    "meaningless until the structure looks right.")
+            chart_label = f"SWING_LENGTH={SWING}"
+        else:
+            st.info("Each day's opening range (first candle(s)) sets the breakout levels. "
+                    "Check the annotated breakouts line up with real range breaks before "
+                    "trusting the numbers below.")
+            chart_label = f"ORB ({OR_BARS}-candle range)"
+
+        st.plotly_chart(chart(df, sw, sig, st.slider("Days shown", 2, 30, 7), chart_label),
+                         use_container_width=True)
+
+        st.subheader("Results")
+        if t.empty:
+            st.warning("No trades for these settings.")
+        else:
+            gross = t.points.sum()
+            if OPT_MODE:
+                hrs = t["hours"] if "hours" in t.columns else pd.Series(2.0, index=t.index)
+                t = t.assign(opt_points=(t.points*DELTA - hrs*THETA_HR - SPREAD).round(2))
+                gross = t.opt_points.sum()
+                st.warning("**Option-buying model** - index moves converted via "
+                           "delta, theta and spread. An approximation, not real "
+                           "option prices.")
+            pc = t.opt_points if OPT_MODE else t.points
+            net = gross - COST_PTS * len(t)
+            h = len(t) // 2
+            h1, h2 = t.points[:h].sum(), t.points[h:].sum()
+            eq = t.points.cumsum()
+            k = st.columns(5)
+            k[0].metric("Trades", len(t))
+            k[1].metric("Win rate", f"{100*(t.points>0).mean():.0f}%")
+            k[2].metric("Gross", f"{gross:+.0f} pts")
+            k[3].metric(f"Net @ {COST_PTS}", f"{net:+.0f} pts", f"Rs {net*LOT:+,.0f}")
+            _eq = pc.cumsum(); _dd = (_eq - _eq.cummax()).min()
+            _per = (PREMIUM*QTY) if OPT_MODE else 0
+            _ddrs = abs(_dd*LOT)
+            st.subheader("Capital required")
+            cc = st.columns(3)
+            cc[0].metric("Per trade", f"Rs {_per:,.0f}")
+            cc[1].metric("Drawdown buffer", f"Rs {_ddrs:,.0f}")
+            cc[2].metric("Minimum capital", f"Rs {_per + _ddrs:,.0f}")
+            st.caption(f"Comfortable: Rs {_per + 2*_ddrs:,.0f}. If one drawdown "
+                       "costs more than ~25% of your account, the size is too big.")
+            k[4].metric("Max DD", f"{(eq-eq.cummax()).min():.0f} pts")
+            if h1 > 0 and h2 > 0:
+                st.success(f"Both halves positive ({h1:+.0f} / {h2:+.0f}) — consistent so far.")
+            else:
+                st.error(f"First half {h1:+.0f}, second half {h2:+.0f}. "
+                         "Only one half positive means this is fitted to that period, not an edge.")
+            st.plotly_chart(go.Figure(go.Scatter(y=eq, mode="lines"))
+                             .update_layout(height=260, title="Equity (points)",
+                                            margin=dict(t=40, b=20)),
+                             use_container_width=True)
+            st.dataframe(t, use_container_width=True, height=300)
+
+# ---------------------------------------------------------------- paper trading
+
+with tab_paper:
+    st.subheader("Paper trading — live")
+    st.caption("Simulates a real broker order lifecycle: entries and exits are placed as "
+               "pending and fill on the *next* check at the actual live price — not "
+               "instantly at the signal price. No real orders are sent. One position at a time.")
+
+    top = st.columns([1, 1, 1, 1])
+    live_on = top[0].toggle("Live", value=True, help="Turn off to pause auto-refresh")
+    REFRESH_SECONDS = top[1].number_input("Refresh (sec)", 30, 600, 60, 15,
+                                           help="Keep this at 60+ to avoid broker rate limits.")
+    STARTING_CAPITAL = top[2].number_input("Paper capital (Rs)", 10000, 10000000, 100000, 5000,
+                                            help="Virtual starting balance. Only applied after Reset.")
+    if top[3].button("Reset paper account"):
+        save_paper({"open": [], "closed": [], "ignored": [], "balance": STARTING_CAPITAL})
+        st.rerun()
+
+    if not OPT_MODE:
+        st.info("Capital tracking (premium debit/credit) needs 'Simulate option buying' "
+                "turned on in the sidebar. Off, P&L shows raw index points only.")
+
+    @st.fragment(run_every=REFRESH_SECONDS if live_on else None)
+    def live_panel():
+        from zoneinfo import ZoneInfo
+        pp = load_paper()
+        now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+        st.caption(f"Instrument: **{INST}** ({EXCH}) · Strategy: **{STRATEGY}** · Interval {INTERVAL}")
+
+        pos = pp["open"][0] if pp["open"] else None
+
+        if OPT_MODE:
+            balance = pp.get("balance", STARTING_CAPITAL)
+            blocked = pos.get("capital_blocked", 0) if pos and pos.get("status") in ("open", "pending_exit") else 0
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Available", f"Rs {balance:,.0f}")
+            b2.metric("Blocked in trade", f"Rs {blocked:,.0f}")
+            b3.metric("Total equity", f"Rs {balance + blocked:,.0f}")
+
+        # ---- live price, for open-position P&L and order fills ----
+        try:
+            price_df = fetch((now - dt.timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M"),
+                              now.strftime("%Y-%m-%d %H:%M"), "ONE_MINUTE", TOKEN, EXCH)
+            ltp = float(price_df.iloc[-1].close) if not price_df.empty else None
+        except Exception as e:
+            st.error(f"Broker call failed: {e}")
+            ltp = None
+
+        # ---- candles for the live chart AND signal scanning (one shared fetch) ----
+        try:
+            chart_df = fetch((now - dt.timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
+                              now.strftime("%Y-%m-%d %H:%M"), INTERVAL, TOKEN, EXCH)
+        except Exception as e:
+            st.error(f"Broker call failed: {e}")
+            chart_df = pd.DataFrame()
+
+        sw, sig = get_signals(chart_df) if not chart_df.empty else (None, pd.DataFrame())
+
+        if not chart_df.empty:
+            chart_days = st.slider("Chart days shown", 1, 5, 1, key="live_chart_days")
+            fig = chart(chart_df, sw, sig, chart_days, f"{INST} live · {STRATEGY}")
+            if pos and pos.get("status") in ("open", "pending_exit") and "entry" in pos:
+                fig.add_hline(y=pos["entry"], line_dash="dot", line_color="#3498db",
+                              annotation_text="Entry", annotation_position="top left")
+                fig.add_hline(y=pos["sl"], line_dash="dot", line_color="#c0392b",
+                              annotation_text="SL", annotation_position="bottom left")
+                fig.add_hline(y=pos["target"], line_dash="dot", line_color="#27ae60",
+                              annotation_text="Target", annotation_position="top left")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Not enough candle data returned yet for the chart.")
+
+        if pos is None:
+            use = sig if (sig.empty or SIGNAL == "both") else sig[sig.type == SIGNAL]
+            opened = False
+            if not chart_df.empty and len(chart_df) >= 3 and not use.empty:
+                last_sig = use.iloc[-1]
+                is_fresh = last_sig.broken_i >= len(chart_df) - 2
+                ts = str(chart_df.iloc[-1].timestamp)
+                seen = {c.get("signal_ts") for c in pp["closed"]} | set(pp["ignored"])
+                if is_fresh and ts not in seen:
+                    pp["open"] = [dict(status="pending_entry", signal_ts=ts,
+                                        instrument=INST, strategy=STRATEGY,
+                                        dir=last_sig.direction,
+                                        type=last_sig.type, sl=round(float(last_sig.Level), 2),
+                                        placed_time=str(now))]
+                    save_paper(pp)
+                    opened = True
+            if opened:
+                st.rerun()
+            else:
+                st.info(f"No open position — watching for a fresh {STRATEGY} signal…")
+
+        elif pos["status"] == "pending_entry":
+            st.markdown("### Order pending — entry")
+            st.caption(f"{pos['dir'].capitalize()} {pos['type']} signal placed {pos['placed_time']}, "
+                       "filling on next check (simulates real order latency).")
+            if ltp is None:
+                st.warning("No live price yet — entry still pending.")
+            else:
+                bull = pos["dir"] == "bullish"
+                sl = pos["sl"]
+                risk = (ltp - sl) if bull else (sl - ltp)
+                if risk <= 0:
+                    pp["ignored"].append(pos["signal_ts"])
+                    pp["open"] = []
+                    save_paper(pp)
+                    st.warning("Entry cancelled — price moved past the stop before the order could fill.")
+                else:
+                    update = dict(status="open", entry=round(ltp, 2), time=str(now),
+                                  target=round(ltp + RR*risk if bull else ltp - RR*risk, 2))
+                    capital_blocked = 0
+                    if OPT_MODE:
+                        capital_blocked = round(PREMIUM * QTY, 2)
+                        update.update(entry_premium=PREMIUM, capital_blocked=capital_blocked)
+                        pp["balance"] = round(pp.get("balance", STARTING_CAPITAL) - capital_blocked, 2)
+                    pos.update(update)
+                    save_paper(pp)
+                    msg = f"Filled at {round(ltp, 2)}"
+                    if OPT_MODE:
+                        msg += f" · Rs {capital_blocked:,.0f} blocked"
+                    st.success(msg)
+
+        elif pos["status"] == "open":
+            if ltp is None:
+                st.warning("No live price data returned yet.")
+            else:
+                bull = pos["dir"] == "bullish"
+                hit_sl = ltp <= pos["sl"] if bull else ltp >= pos["sl"]
+                hit_tg = ltp >= pos["target"] if bull else ltp <= pos["target"]
+                pts = round((ltp - pos["entry"]) if bull else (pos["entry"] - ltp), 2)
+
+                if hit_sl or hit_tg:
+                    pos.update(status="pending_exit", trigger="SL" if hit_sl else "Target",
+                               trigger_time=str(now))
+                    save_paper(pp)
+                    st.warning(f"{pos['trigger']} triggered — exit order placed, filling on next check.")
+                else:
+                    hours_held = max((now - dt.datetime.fromisoformat(pos["time"])).total_seconds() / 3600, 0)
+                    live_premium = None
+                    if OPT_MODE and "entry_premium" in pos:
+                        opt_pts = round(pts*DELTA - hours_held*THETA_HR - SPREAD, 2)
+                        live_premium = max(0.0, round(pos["entry_premium"] + opt_pts, 2))
+                        pnl_rs = round((live_premium - pos["entry_premium"]) * QTY, 2)
+                    else:
+                        pnl_rs = round(pts * QTY, 2)
+
+                    st.markdown("### Open position")
+                    c = st.columns(7)
+                    c[0].metric("Instrument", pos.get("instrument", INST))
+                    c[1].metric("Direction", pos["dir"].capitalize())
+                    c[2].metric("Entry", pos["entry"])
+                    c[3].metric("LTP", ltp)
+                    c[4].metric("P&L (pts)", f"{pts:+.2f}")
+                    c[5].metric("P&L (Rs)", f"{pnl_rs:+,.0f}")
+                    c[6].metric("Type", pos["type"])
+                    if live_premium is not None:
+                        st.caption(f"SL {pos['sl']} · Target {pos['target']} · filled {pos['time']} · "
+                                   f"Est. option value now: Rs {live_premium} "
+                                   f"(entry Rs {pos['entry_premium']}, blocked Rs {pos.get('capital_blocked', 0):,.0f})")
+                    else:
+                        st.caption(f"SL {pos['sl']} · Target {pos['target']} · filled {pos['time']}")
+
+        elif pos["status"] == "pending_exit":
+            st.markdown("### Order pending — exit")
+            st.caption(f"{pos['trigger']} triggered at {pos['trigger_time']}, filling on next check.")
+            if ltp is None:
+                st.warning("No live price yet — exit still pending.")
+            else:
+                bull = pos["dir"] == "bullish"
+                pts = round((ltp - pos["entry"]) if bull else (pos["entry"] - ltp), 2)
+                pos.update(exit=pos["trigger"], exit_price=round(ltp, 2), exit_time=str(now), points=pts)
+
+                if OPT_MODE and "entry_premium" in pos:
+                    hours_held = max((now - dt.datetime.fromisoformat(pos["time"])).total_seconds() / 3600, 0)
+                    opt_pts = round(pts*DELTA - hours_held*THETA_HR - SPREAD, 2)
+                    exit_premium = max(0.0, round(pos["entry_premium"] + opt_pts, 2))
+                    proceeds = round(exit_premium * QTY, 2)
+                    pos.update(opt_points=opt_pts, exit_premium=exit_premium, proceeds=proceeds,
+                               hours_held=round(hours_held, 2))
+                    pp["balance"] = round(pp.get("balance", STARTING_CAPITAL) + proceeds, 2)
+                else:
+                    pp["balance"] = round(pp.get("balance", STARTING_CAPITAL) + pts*QTY, 2)
+
+                pp["closed"].append(pos)
+                pp["open"] = []
+                save_paper(pp)
+                st.success(f"Exit filled — {pos['exit']} @ {round(ltp, 2)}")
+
+        st.caption(f"Last checked {now:%d %b %H:%M:%S}" + (" · live" if live_on else " · paused"))
+
+        st.markdown("**Closed trades**")
+        if pp["closed"]:
+            c = pd.DataFrame(pp["closed"])
+            tot = c.points.sum()
+            m = st.columns(5)
+            m[0].metric("Trades", len(c))
+            m[1].metric("Win rate", f"{100*(c.points>0).mean():.0f}%")
+            m[2].metric("Gross", f"{tot:+.1f} pts")
+            m[3].metric(f"Net @ {COST_PTS}", f"Rs {(tot-COST_PTS*len(c))*LOT:+,.0f}")
+            m[4].metric("Balance", f"Rs {pp.get('balance', STARTING_CAPITAL):,.0f}")
+            cols_show = [x for x in ["instrument", "strategy", "dir", "type", "entry", "sl", "target",
+                                      "exit", "exit_price", "exit_time", "points", "opt_points",
+                                      "exit_premium", "proceeds"] if x in c.columns]
+            st.dataframe(c[cols_show], use_container_width=True)
+        else:
+            st.caption("No closed paper trades yet.")
+
+    live_panel()
+
+# ---------------------------------------------------------------- chart (search any instrument)
+
+with tab_chart:
+    st.subheader("Chart")
+    st.caption("Shows the sidebar's selected Instrument automatically, with real-time ticks "
+               "over WebSocket. Use search below to look at a different instrument instead.")
+
+    if st.session_state.get("chart_last_sidebar_inst") != INST:
+        st.session_state.chart_sel = {"tradingsymbol": INST, "symboltoken": TOKEN, "exchange": EXCH}
+        st.session_state.chart_last_sidebar_inst = INST
+
+    if "chart_search_results" not in st.session_state:
+        st.session_state.chart_search_results = []
+
+    with st.expander("Search a different instrument"):
+        sc1, sc2, sc3 = st.columns([1, 2, 1])
+        search_exch = sc1.selectbox("Exchange", ["NSE", "NFO", "MCX", "BSE"], key="chart_search_exch")
+        search_query = sc2.text_input("Search instrument", placeholder="e.g. RELIANCE, TCS",
+                                       key="chart_search_query")
+        sc3.markdown("<br>", unsafe_allow_html=True)
+        if sc3.button("Search", type="primary", key="chart_search_btn"):
+            if not search_query.strip():
+                st.warning("Type something to search first.")
+            else:
+                try:
+                    res = broker().searchScrip(search_exch, search_query.strip())
+                    st.session_state.chart_search_results = res.get("data", []) if res.get("status") else []
+                    if not st.session_state.chart_search_results:
+                        st.warning("No matches found.")
+                except Exception as e:
+                    st.error(f"Search failed: {e}")
+                    st.session_state.chart_search_results = []
+
+        results = st.session_state.chart_search_results
+        if results:
+            options = {f"{r['tradingsymbol']}  ·  {r['exchange']}  ·  token {r['symboltoken']}": r
+                       for r in results}
+            picked = st.selectbox("Results", list(options), key="chart_search_pick")
+            if st.button("Load this instead", key="chart_load_btn"):
+                st.session_state.chart_sel = options[picked]
+                st.rerun()
+
+    sel = st.session_state.chart_sel
+    st.divider()
+    cc1, cc2, cc3 = st.columns([2, 1, 1])
+    cc1.markdown(f"### {sel['tradingsymbol']} ({sel['exchange']})")
+    chart_interval = cc2.selectbox("Interval",
+        ["ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE"], 2,
+        key="chart_interval")
+    chart_live_on = cc3.toggle("Live", value=True, key="chart_live_toggle")
+
+    @st.fragment(run_every=1.5 if chart_live_on else None)
+    def live_chart_panel():
+        import json as _json, time as _time
+        sel = st.session_state.chart_sel
+        ts = tick_service()
+        ts.ensure_subscribed(sel["exchange"], sel["symboltoken"])
+
+        bucket = int(_time.time() // 30)
+        try:
+            df = get_bucketed_candles(sel["symboltoken"], sel["exchange"], chart_interval, bucket)
+        except Exception as e:
+            st.error(f"Broker call failed: {e}")
+            df = pd.DataFrame()
+
+        if df.empty:
+            st.warning("No candle data returned yet.")
+            return
+
+        days = st.slider("Days shown", 1, 10, 2, key="chart_days_shown")
+        m = df.timestamp >= df.timestamp.max() - pd.Timedelta(days=days)
+        r = df[m].copy()
+
+        ltp = ts.get_ltp(sel["symboltoken"])
+        if ltp is not None and len(r) > 0:
+            i = r.index[-1]
+            r.loc[i, "close"] = ltp
+            r.loc[i, "high"] = max(r.loc[i, "high"], ltp)
+            r.loc[i, "low"] = min(r.loc[i, "low"], ltp)
+
+        candles = [
+            dict(time=int(row.timestamp.timestamp()) + 19800,
+                 open=round(float(row.open), 2), high=round(float(row.high), 2),
+                 low=round(float(row.low), 2), close=round(float(row.close), 2))
+            for _, row in r.iterrows()
+        ]
+        candles_json = _json.dumps(candles)
+        html = f"""
+        <div id="tv_chart" style="height:560px;"></div>
+        <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+        <script>
+          const el = document.getElementById('tv_chart');
+          const chart = LightweightCharts.createChart(el, {{
+            width: el.clientWidth,
+            height: 560,
+            layout: {{ background: {{ color: '#131722' }}, textColor: '#d1d4dc' }},
+            grid: {{ vertLines: {{ color: '#1e222d' }}, horzLines: {{ color: '#1e222d' }} }},
+            timeScale: {{ timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' }},
+            rightPriceScale: {{ borderColor: '#2a2e39' }},
+            crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+          }});
+          const series = chart.addCandlestickSeries({{
+            upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+            wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+          }});
+          series.setData({candles_json});
+          chart.timeScale().fitContent();
+          window.addEventListener('resize', () => {{
+            chart.applyOptions({{ width: el.clientWidth }});
+          }});
+        </script>
+        """
+        components.html(html, height=580)
+
+        status = "\U0001F7E2 live tick" if ltp is not None else "\U0001F7E1 waiting for first tick…"
+        st.caption(f"{sel['tradingsymbol']} · {chart_interval} · {status}" +
+                   (f" · LTP {ltp}" if ltp is not None else "") +
+                   (" · paused" if not chart_live_on else ""))
+
+    live_chart_panel()
+
+# ---------------------------------------------------------------- live
+
+with tab_live:
+    st.subheader("Live trading")
+    st.error("**Not enabled.** This strategy has one out-of-sample result behind it. "
+             "That is not enough evidence to risk money.")
+    st.markdown("""
+Before wiring real orders, all of these should be true:
+
+- **Several months of paper trading** on the Paper tab, with results that match
+  the backtest. If paper and backtest disagree, the backtest is wrong.
+- **Walk-forward validation**, not just the single split already run.
+- **Costs measured, not estimated** — from your actual AngelOne contract notes.
+- **A daily loss limit you will not override.** Decide it now, while nothing is
+  at stake.
+
+If all of that holds, order placement goes here — `obj.placeOrder(...)`. It's
+deliberately not written yet, because an untested strategy with a working order
+button is how accounts get damaged.
+""")
+    st.caption("Ask me to add order placement once the paper results are in.")
