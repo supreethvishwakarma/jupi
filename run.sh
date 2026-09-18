@@ -3,6 +3,10 @@ set -e
 
 cd /workspaces/jupi
 
+echo "== Killing any old Streamlit processes =="
+pkill -f "streamlit run" 2>/dev/null || true
+sleep 2
+
 PORT="${PORT:-8501}"
 
 find_free_port() {
@@ -31,10 +35,6 @@ if [ -n "${CODESPACE_NAME:-}" ] && [ "${CODESPACES:-}" = "true" ]; then
   echo "== Codespace detected: ${CODESPACE_NAME} =="
   echo "== Forwarded URL: https://${CODESPACE_NAME}-${PORT}.app.github.dev/ =="
 fi
-
-echo "== Killing any old Streamlit processes =="
-pkill -f "streamlit run" 2>/dev/null || true
-sleep 1
 
 echo "== Checking .env exists =="
 if [ ! -f .env ]; then
