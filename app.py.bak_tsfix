@@ -1393,7 +1393,6 @@ with tab_paper:
         from zoneinfo import ZoneInfo
         pp = load_paper()
         now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-        ts = tick_service()
 
         if not live_on:
             st.caption("Signal scan paused -- no new positions will open until you click START.")
