@@ -1021,17 +1021,7 @@ with tab_paper:
             if _pos.get("status") != "open":
                 del pp["open"][_inst_name]
                 continue
-            if _pos.get("mode") == "short_straddle" and "ce_token" in _pos:
-                _ce_bid, _ce_ask = get_bid_ask(_pos["ce_exch"], _pos["ce_token"])
-                _pe_bid, _pe_ask = get_bid_ask(_pos["pe_exch"], _pos["pe_token"])
-                _ce_buyback = _ce_ask if _ce_ask is not None else _ts_stop.get_ltp(_pos["ce_token"])
-                _pe_buyback = _pe_ask if _pe_ask is not None else _ts_stop.get_ltp(_pos["pe_token"])
-                if _ce_buyback is not None and _pe_buyback is not None:
-                    _close_short_straddle(pp, _inst_name, _pos, reason, _ce_buyback, _pe_buyback, _now_stop, _qty_i)
-                    _closed_count += 1
-                else:
-                    del pp["open"][_inst_name]
-            elif "ce_token" in _pos:
+            if "ce_token" in _pos:
                 _ce_bid, _ce_ask = get_bid_ask(_pos["ce_exch"], _pos["ce_token"])
                 _pe_bid, _pe_ask = get_bid_ask(_pos["pe_exch"], _pos["pe_token"])
                 _ce_exit = _ce_bid if _ce_bid is not None else _ts_stop.get_ltp(_pos["ce_token"])
